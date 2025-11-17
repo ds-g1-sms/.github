@@ -293,7 +293,7 @@ Data Partitioning by Entity:
 - ⚠️ Higher latency than centralized (consensus overhead)
 
 **Tech Stack**:
-- Language: Go (systems programming, concurrency)
+- Language: Java (systems programming, concurrency)
 - Database: CockroachDB (built-in distribution)
 - Consensus: etcd
 - DHT: libp2p (IPFS networking stack)
