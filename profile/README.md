@@ -4,164 +4,139 @@
 
 ## Architecture Overview
 
-## Core Architecture: Hybrid P2P with Distributed Hash Table (DHT)
+## Core Architecture: Distributed Chat System
 
 ### System Components
 
 1. **Node Types** (all nodes are equal peers)
    - Each node runs the full chat service stack
-   - Each node maintains a subset of the global state
-   - Minimum 3 nodes for consensus/fault tolerance
+   - Each node can host chat rooms
+   - Minimum 3 nodes for fault tolerance
 
 2. **State Management Layer**
-   - **Distributed Hash Table (DHT)**: For data partitioning and lookup (e.g., Kademlia-based)
-   - **Replicated State Machines**: Each partition replicated across multiple nodes
-   - **Consistent Hashing**: For even data distribution and minimal reshuffling
+   - **In-Memory State**: For active chat rooms and messages
+   - **Optional Persistent Storage**: For future chat history (not in initial prototype)
+   - **Room Distribution**: Rooms distributed across nodes
 
-3. **Consensus Layer**
-   - **Raft Consensus Protocol**: For strongly consistent operations
-     - Leader election per data partition
-     - Log replication for state changes
-     - Handles: room creation, membership changes, role assignments
+3. **Coordination Layer**
+   - **Administrator-Based Message Ordering**: Room creator/admin decides message order
+   - **Two-Phase Commit Protocol**: For room deletion coordination
+     - Simpler than Raft, sufficient for coordinated operations
+     - Easier to implement and understand
+     - Acceptable trade-off with node failure scenarios
    
-4. **Eventual Consistency Layer**
-   - **Conflict-free Replicated Data Types (CRDTs)**: For messages and presence
-     - Messages use timestamp-based ordering
-     - Presence status uses Last-Write-Wins (LWW)
-     - Allows partition tolerance with eventual convergence
-
-## Data Distribution Strategy
-
-### Partitioning Scheme
-
-```
-Data Partitioning by Entity:
-├── Users: Hash(user_id) → Node
-├── Chat Rooms: Hash(room_id) → Node  
-├── Memberships: Hash(room_id) → Node (co-located with room)
-└── Messages: Hash(room_id) → Node (co-located with room)
-```
-
-**Replication Factor**: 3 (each data partition stored on 3 nodes)
-- Primary replica (leader): Handles writes via Raft
-- Secondary replicas (followers): Handle reads, participate in consensus
+4. **Consistency Approach**
+   - **Administrator Authority**: The node hosting a room acts as authority for that room
+   - **Message Ordering**: Administrator node determines final message order
+   - **Membership Management**: Administrator handles join/leave operations
 
 ## Addressing Your Requirements
 
 ### a) Stateful with Global State
 
-**Solution**: Distributed database with multi-master replication
+**Solution**: Distributed state across peer nodes
 
-- **CockroachDB**: Distributed SQL with sharding
-- Each node maintains portion of global state
-- Global state reconstructed via DHT queries across nodes
-- Metadata registry: Each node maintains routing table of data locations
+- Each node maintains its own state (rooms it hosts, connected users)
+- Nodes communicate to share information about available rooms
+- Node discovery through direct peer connections
+- **CockroachDB**: For optional persistent storage (future feature)
 
 **State Components**:
-- User registry (distributed)
-- Room registry (distributed)
-- Membership mappings (co-located with rooms)
-- Message logs (partitioned by room)
+- Local room registry per node
+- Connected users per node
+- In-memory message buffers (no history before joining in prototype)
+- Optional: Future persistent storage for chat history
 
 ### b) Data Consistency and Synchronization
 
-**Multi-level consistency model**:
+**Administrator-Based Consistency Model**:
 
-**Strong Consistency** (using Raft):
-- User account creation/deletion
-- Room creation/deletion
-- Membership additions/removals
-- Role assignments (admin/member)
+**Room Administrator Authority**:
+- The node that creates a room becomes its administrator
+- Administrator node is the authority for message ordering
+- Members follow the administrator's ordering decisions
+- Simple and sufficient complexity for the system
 
-**Eventual Consistency** (using CRDTs):
-- Message delivery
-- User presence/status updates
-- Typing indicators
-- Last read timestamps
-
-**Synchronization Protocol**:
+**Message Synchronization**:
 ```
-1. Write Operation:
-   - Client → Any Node (coordinator)
-   - Coordinator determines partition via consistent hashing
-   - Coordinator forwards to partition leader
-   - Leader proposes via Raft consensus
-   - Quorum acknowledgment (2 of 3 replicas)
-   - Async replication to remaining nodes
+1. Message Send:
+   - Client → Connected Node
+   - If node is room admin: Accept and broadcast with sequence number
+   - If node is not admin: Forward to administrator node
+   - Administrator assigns order and broadcasts to all members
+   - Members receive and display in administrator's order
 
-2. Read Operation:
-   - Read from any replica (with potential stale reads)
-   - OR read from leader (strongly consistent)
-   - Configurable per operation
+2. Room Operations:
+   - Join/Leave: Handled by administrator node
+   - Room Info: Queried from administrator node
+   - Room Deletion: Two-phase commit across relevant nodes
 ```
 
-**Conflict Resolution**:
-- Vector clocks for causality tracking
-- Application-level merge for messages (append-only log)
-- Last-write-wins for user metadata with timestamps
+**Benefits of Administrator Approach**:
+- Simpler than complex consensus protocols
+- Clear authority for message ordering
+- Reduces system complexity significantly
+- Sufficient for course requirements
 
 ### c) Consensus (Shared Decision)
 
-**Raft Consensus for Critical Operations**:
+**Simplified Coordination with Two-Phase Commit**:
 
-**Per-Partition Raft Groups**:
-- Each data partition has its own Raft group (3 nodes)
-- One leader per partition handles writes
-- Followers replicate log entries
-- Leader election on failure (typically <1 second)
+**When Coordination is Needed**:
+- Room deletion (needs to be coordinated across nodes)
+- Potentially room migration (future feature)
 
-**Consensus Required For**:
-1. Room creation → All replicas agree on room_We can go ahead with direct node connections. We don't need to implement fault tolerance and scalability right now. We'll do CockroachDB for the DB and Go for the system programming and etcd for consensus.id and creator
-2. Adding/removing members → Prevents duplicate adds
-3. Role changes → Ensures only one admin assignment at a time
-4. Room deletion → Coordinated cleanup across nodes
-
-**Consensus Algorithm**:
+**Two-Phase Commit Protocol for Room Deletion**:
 ```
-1. Client request → Coordinator node
-2. Coordinator → Raft leader for partition
-3. Leader appends to log, sends to followers
-4. Followers acknowledge
-5. Leader commits when quorum reached (2/3)
-6. Leader responds to coordinator
-7. Coordinator responds to client
+Phase 1 (Prepare):
+1. Administrator node initiates deletion
+2. Sends PREPARE message to all nodes with room members
+3. Each node checks if it can delete (no pending operations)
+4. Nodes respond with READY or ABORT
+
+Phase 2 (Commit):
+1. If all nodes respond READY:
+   - Administrator sends COMMIT message
+   - All nodes delete room data
+2. If any node responds ABORT:
+   - Administrator sends ROLLBACK message
+   - Deletion is cancelled
 ```
 
-**Optimization**: Leader leases (reduce leader checks)
+**Why Two-Phase Commit Instead of Raft**:
+- Much simpler to implement and understand
+- Sufficient for room deletion coordination
+- Learning existing Raft implementation is time-consuming
+- Implementing Raft from scratch is not recommended (too complex)
+- Acceptable trade-off: May have issues with node failure, but simpler design
+
+**Note**: For the prototype, we may not even implement room deletion to keep it simpler.
 
 ### d) Fault Tolerance
 
 **Node Failure Handling**:
 
-**Single Node Failure** (1 of 3):
-- Raft continues with 2/3 majority
-- Reads/writes proceed normally
-- System operates at reduced redundancy
+**Administrator Node Failure**:
+- Rooms hosted on failed node become unavailable
+- Users in those rooms are disconnected
+- For prototype: Simple detection and notification
+- Future enhancement: Room migration to another node
 
-**Two Node Failure** (2 of 3):
-- Affected partitions enter read-only mode
-- No consensus possible for writes
-- Existing data remains readable
-- System degraded but operational
+**Member Node Failure**:
+- User disconnects from room
+- Administrator removes user from room member list
+- No impact on room availability
 
-**Network Partition** (Split Brain):
-- Raft prevents split-brain via majority quorum
-- Minority partition becomes read-only
-- Majority partition continues operating
-- Automatic reconciliation on partition heal
+**Fault Tolerance Strategies** (for prototype):
+1. **Health Checks**: Basic heartbeat between nodes
+2. **Failure Detection**: Timeout-based detection
+3. **Graceful Degradation**: Rooms survive as long as admin node is up
+4. **User Notification**: Inform users when rooms become unavailable
 
-**Fault Tolerance Strategies**:
-1. **Replication**: 3x replication factor
-2. **Health Checks**: Heartbeat every 50-150ms
-3. **Failure Detection**: Timeout-based (typically 150-300ms)
-4. **Automatic Failover**: New leader election <1s
-5. **Data Recovery**: Failed nodes catch up via log replay
-6. **Checksums**: Detect data corruption
-
-**Backup Strategy**:
-- Periodic snapshots (every N log entries)
-- Write-ahead logging (WAL)
-- Incremental backups to external storage
+**Future Enhancements** (beyond prototype):
+- Room replication across multiple nodes
+- Automatic room migration on node failure
+- Persistent storage to recover room state
 
 ### e) Scalability
 
@@ -169,135 +144,159 @@ Data Partitioning by Entity:
 
 **Adding New Nodes**:
 ```
-1. New node joins DHT network
-2. Announces capacity to existing nodes
-3. Consistent hashing recalculates partitions
-4. Data migration begins (typically 1/N of data where N = nodes)
-5. Replication factor maintained
-6. Gradual traffic shift to new node
+1. New node joins the network
+2. Announces itself to existing nodes
+3. New node can host new rooms
+4. Users can connect to any available node
+5. Room discovery: Nodes share information about available rooms
 ```
 
-**Scaling Dimensions**:
-
-**Storage Scalability**:
-- More nodes = more total storage
-- Consistent hashing ensures O(log N) lookup
-- Each node stores ~1/N of total data
-
-**Throughput Scalability**:
-- Read scaling: Queries distributed across replicas
-- Write scaling: Each partition independent
-- Message delivery: Parallel processing per room
+**Scaling Approach**:
 
 **User Scalability**:
-- DHT lookup: O(log N) complexity
-- Room discovery: Distributed indices
-- Connection handling: Each node handles subset of users
+- More nodes = more users can connect
+- Each node handles its own connected users
+- Load distribution through client choice of connection node
 
-**Bottleneck Mitigation**:
-1. **Hot Partitions**: Automatically split popular rooms
-2. **Read Heavy**: Add read replicas (>3 replicas)
-3. **Write Heavy**: Shard rooms into sub-rooms
-4. **Large Rooms**: Message pagination, lazy loading
+**Room Scalability**:
+- More nodes = more rooms can be hosted
+- Each node can host multiple rooms
+- Rooms are independent from each other
 
-**Performance Targets** (example):
-- 10,000+ concurrent users per 3-node cluster
-- 100,000+ messages/second aggregate
-- <100ms p99 message delivery latency
-- Linear scaling to 10+ nodes
+**Prototype Scalability** (simplified):
+- Start with 3-5 nodes
+- Fixed number of rooms (one per node initially)
+- Focus on demonstrating server-to-server communication
+- Scaling complexity deferred to future enhancements
 
 ## Communication Protocols
 
-### Inter-Node Communication
-- **gRPC** or **WebSockets**: Low-latency RPC
+### Inter-Node Communication (Server-to-Server)
+- **gRPC**: For structured server-to-server communication
 - **Protocol Buffers**: Efficient serialization
-- **TLS**: Encrypted node-to-node communication
+- Focus area for the course requirements
+- Handles: room discovery, message forwarding, coordination
 
 ### Client-Node Communication
 - **WebSockets**: Real-time bidirectional messaging
-- **HTTP/2**: REST API for control operations
-- **Load balancing**: Client connects to any node (DNS round-robin or client-side)
+- Clients can be co-located with servers for prototype
+- Simple connection protocol
 
 ## System Architecture Diagram
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                         Client Layer                        │
-│  (Mobile Apps, Web Clients) - Connect to any node           │
+│                    Client Layer (Co-located)                │
+│     Simple clients on same nodes as servers for prototype   │
 └─────────────────┬───────────────────────────────────────────┘
-                  │ WebSocket/HTTP
+                  │ WebSocket
 ┌─────────────────┴───────────────────────────────────────────┐
-│                    Node 1 (Peer)                            │
+│                    Node 1 (Peer & Admin for Room A)         │
 │  ┌──────────────────────────────────────────────────────┐   │
-│  │ API Gateway (WebSocket + REST)                       │   │
+│  │ Client Handler (WebSocket)                           │   │
 │  └──────────────┬───────────────────────────────────────┘   │
 │  ┌──────────────┴───────────────────────────────────────┐   │
 │  │ Business Logic Layer                                 │   │
-│  │  - Room Management  - User Management                │   │
-│  │  - Message Handling - Authorization                  │   │
+│  │  - Room Management (Admin for owned rooms)           │   │
+│  │  - Message Ordering (for administered rooms)         │   │
+│  │  - Member Management                                 │   │
 │  └──────────────┬───────────────────────────────────────┘   │
 │  ┌──────────────┴───────────────────────────────────────┐   │
-│  │ Consistency Layer                                    │   │
-│  │  - Raft Consensus Module (Leader/Follower)           │   │
-│  │  - CRDT Merge Engine                                 │   │
+│  │ Coordination Layer                                   │   │
+│  │  - Two-Phase Commit (for deletion)                   │   │
+│  │  - Node Discovery & Communication                    │   │
 │  └──────────────┬───────────────────────────────────────┘   │
 │  ┌──────────────┴───────────────────────────────────────┐   │
-│  │ Distributed State Layer                              │   │
-│  │  - DHT Client (Kademlia)                             │   │
-│  │  - Partition Manager                                 │   │
-│  │  - Vector Clock Tracker                              │   │
+│  │ State Layer (In-Memory)                              │   │
+│  │  - Local Room State (Room A)                         │   │
+│  │  - Connected Users                                   │   │
+│  │  - Message Buffer (no history before join)           │   │
 │  └──────────────┬───────────────────────────────────────┘   │
 │  ┌──────────────┴───────────────────────────────────────┐   │
-│  │ Storage Layer                                        │   │
-│  │  - PostgreSQL/CockroachDB (partitioned data)         │   │
-│  │  - Write-Ahead Log (WAL)                             │   │
+│  │ Optional: Future Persistent Storage                  │   │
+│  │  - CockroachDB (for chat history)                    │   │
 │  └──────────────────────────────────────────────────────┘   │
 └─────────────────┬───────────────────────────────────────────┘
-                  │ gRPC/Gossip Protocol
+                  │ gRPC (Server-to-Server Communication)
          ┌────────┴────────┬────────────────┐
          │                 │                │
     ┌────┴─────┐      ┌────┴─────┐     ┌────┴─────┐
     │  Node 2  │←────→│  Node 3  │←───→│  Node 1  │
-    │  (Peer)  │      │  (Peer)  │     │  (Peer)  │
+    │ (Room B) │      │ (Room C) │     │ (Room A) │
     └──────────┘      └──────────┘     └──────────┘
-    (Same internal structure as Node 1)
+    (Each node administers its own room(s))
 ```
 
-## Deployment Recommendations
+## Prototype Implementation Approach
 
-### Minimum Viable Deployment
-- **3 nodes**: Minimum for fault tolerance and consensus
-- **Each node**: 4 CPU cores, 8GB RAM, 100GB SSD
-- **Network**: Low-latency (<10ms between nodes)
-- **Geographic**: Single datacenter initially
+### Simplest Running Prototype (Start Here)
+Focus on getting a working system quickly, then add features:
 
-### Production Deployment
-- **5-7 nodes**: Better fault tolerance
-- **Multi-region**: Nodes across 2-3 regions
-- **Monitoring**: Prometheus + Grafana
-- **Logging**: ELK stack or similar
-- **Alerting**: PagerDuty for consensus failures
+**Phase 1 - Basic Prototype**:
+- **Fixed chat rooms**: One room per server (3 rooms for 3 nodes)
+- **No persistent storage**: All state in memory
+- **No history**: Clients only see messages sent after they join
+- **Group chat only**: No private messaging needed for prototype
+- **Co-located clients**: Clients run on same machines as servers
+- **Focus**: Server-to-server communication for message distribution
+
+**Key Implementation Notes**:
+- Course focus is on **server-to-server communication** - this is the priority
+- Client implementation can be very simple (even command-line)
+- Keep extensibility in mind for adding features later
+- Design should allow adding dynamic rooms and persistence before demo
+
+**Benefits of Simple Start**:
+- Get running system quickly
+- Demonstrate core distributed concepts
+- Test server-to-server communication thoroughly
+- Working foundation to build upon
+- Less time learning complex frameworks (Raft, DHT)
+
+### Phase 2 - Enhanced Prototype (If Time Permits)
+Add features incrementally:
+- Dynamic room creation (clients can create rooms on any node)
+- Room discovery mechanism across nodes
+- Basic persistence (CockroachDB for chat history)
+- Client history retrieval upon joining
+- Room deletion with two-phase commit
+
+**Design Principle**: Build simple first, but architect with extensibility in mind so features can be added just before demo if time allows.
+
+### Development Environment
+- **3-5 nodes**: For prototype testing
+- **Single machine**: Can run all nodes locally
+- **Network**: localhost connections for development
+- **Simple setup**: Easy to iterate and debug
+- **Clients co-located**: Simplifies deployment for prototype
 
 ## Trade-offs and Considerations
 
-**Advantages**:
-- ✅ No single point of failure
-- ✅ Scales horizontally
-- ✅ Strong consistency where needed
-- ✅ High availability (survives 1 node failure)
+**Advantages of Simplified Design**:
+- ✅ Much simpler to implement and understand
+- ✅ Administrator-based ordering is intuitive
+- ✅ Two-phase commit is easier than Raft
+- ✅ Focuses on core distributed system concepts
+- ✅ Achievable within course timeline
 
-**Challenges**:
-- ⚠️ Complex implementation (Raft + DHT + CRDTs)
-- ⚠️ Network partitions require careful handling
-- ⚠️ Eventual consistency for messages (potential reordering)
-- ⚠️ Higher latency than centralized (consensus overhead)
+**Known Limitations** (Acceptable for prototype):
+- ⚠️ Room unavailable if administrator node fails
+- ⚠️ Two-phase commit has issues with coordinator failure
+- ⚠️ No chat history before joining (prototype)
+- ⚠️ Limited fault tolerance in initial version
+
+**Future Enhancements** (Beyond Prototype):
+- Room replication for high availability
+- Persistent storage for chat history
+- More sophisticated consensus if needed
+- Dynamic room migration
 
 **Tech Stack**:
-- Language: Java (systems programming, concurrency)
-- Database: CockroachDB (built-in distribution)
-- Consensus: etcd
-- DHT: libp2p (IPFS networking stack)
-- Message Queue: Apache Kafka (for message streaming)
+- **Language**: Go (systems programming, excellent concurrency support)
+- **Server-to-Server**: gRPC with Protocol Buffers
+- **Database**: CockroachDB (optional, for future persistence)
+- **Coordination**: Custom two-phase commit implementation
+- **Consensus**: etcd (optional, if time permits for advanced features)
 
 <!--
 
